@@ -1,0 +1,120 @@
+--- a/ebooklib/book.py
++++ b/ebooklib/book.py
+@@ -26,6 +26,76 @@
+ from ebooklib.utils import guess_type
+ 
+ 
++class _ItemList(list):
++    """List of book items that maintains an ``id -> first item`` index.
++
++    ``get_item_with_id`` used to scan every item on each call, which made building
++    a book quadratic in the number of items. Appends update the index in O(1);
++    anything that can reorder or drop items only marks it dirty and the next lookup
++    rebuilds, so the index never goes stale even if callers mutate ``book.items``
++    directly.
++    """
++
++    __slots__ = ("_index", "_dirty")
++
++    def __init__(self, iterable=()):
++        super().__init__(iterable)
++        self._index = {}
++        self._dirty = True
++
++    def _rebuild(self):
++        self._index = {}
++        for item in self:
++            self._index.setdefault(item.id, item)  # first item wins, like the scan
++        self._dirty = False
++
++    def lookup(self, uid):
++        if not self._dirty:
++            item = self._index.get(uid)
++            # item.id may have been reassigned since the index was built
++            if item is not None and item.id == uid:
++                return item
++        self._rebuild()
++        return self._index.get(uid)
++
++    def __reduce_ex__(self, protocol):
++        # rebuild through __init__ so unpickling does not append into a
++        # half-initialised instance (list subclasses replay APPEND before state)
++        return (self.__class__, (list(self),))
++
++    def append(self, item):
++        super().append(item)
++        if not self._dirty:
++            self._index.setdefault(item.id, item)
++
++    def extend(self, items):
++        items = list(items)
++        super().extend(items)
++        if not self._dirty:
++            for item in items:
++                self._index.setdefault(item.id, item)
++
++    def __iadd__(self, items):
++        self.extend(items)
++        return self
++
++
++def _invalidating(name):
++    original = getattr(list, name)
++
++    def mutate(self, *args, **kwargs):
++        result = original(self, *args, **kwargs)
++        self._dirty = True
++        return result
++
++    return mutate
++
++
++# insert/delete/reorder can change which item is "first" for an id
++for _name in ("insert", "__setitem__", "__delitem__", "pop", "remove", "clear", "sort", "reverse", "__imul__"):
++    setattr(_ItemList, _name, _invalidating(_name))
++
++
+ class EpubBook:
+     def __init__(self) -> None:
+         self.EPUB_VERSION: str | None = None
+@@ -42,7 +112,7 @@
+         """Initialises all needed variables to default values"""
+ 
+         self.metadata: dict[str | None, dict[str, list[Any]]] = {}
+-        self.items: list[EpubItem] = []
++        self.items: list[EpubItem] = _ItemList()
+         self.spine: list[Any] = []
+         self.guide: list[dict[str, Any]] = []
+         self.pages: list[Any] = []
+@@ -260,6 +330,13 @@
+         :Returns:
+           Returns item object. Returns None if nothing was found.
+         """
++        if isinstance(self.items, _ItemList):
++            try:
++                return self.items.lookup(uid)
++            except TypeError:
++                # unhashable uid: fall back to the linear scan
++                pass
++
+         for item in self.get_items():
+             if item.id == uid:
+                 return item
+--- a/ebooklib/items.py
++++ b/ebooklib/items.py
+@@ -35,6 +35,15 @@
+     Base class for the items in a book.
+     """
+ 
++    def __setattr__(self, name, value):
++        # Re-assigning an id changes which item is "first" for that id, so the
++        # book's id index has to be rebuilt on the next lookup.
++        if name == "id":
++            items = getattr(getattr(self, "book", None), "items", None)
++            if items is not None and hasattr(items, "_dirty"):
++                items._dirty = True
++        super().__setattr__(name, value)
++
+     def __init__(
+         self,
+         uid: str | None = None,
